@@ -32,6 +32,10 @@ class TestUtils(unittest.TestCase):
         text = "1.5 hours"
         self.assertEqual(90, get_minutes(text))
 
+    def test_get_minutes_integer_days(self):
+        text = "2 days"
+        self.assertEqual(2880, get_minutes(text))
+
     def test_get_minutes_fraction_with_fraction_unicode_character_halves(self):
         text = "1½ hours"
         self.assertEqual(90, get_minutes(text))
@@ -72,6 +76,10 @@ class TestUtils(unittest.TestCase):
         text = "15 to 20 minutes"
         self.assertEqual(20, get_minutes(text))
 
+    def test_get_minutes_imprecise_description(self):
+        text = "Pá-Pum"
+        self.assertEqual(None, get_minutes(text))
+
     iso8601_fixtures = {
         "PT1H": 60,
         "PT20M": 20,
@@ -101,8 +109,10 @@ class TestUtils(unittest.TestCase):
                 "cook_time",
                 "cuisine",
                 "description",
+                "equipment",
                 "host",
                 "image",
+                "ingredient_groups",
                 "ingredients",
                 "instructions",
                 "instructions_list",

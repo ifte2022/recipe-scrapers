@@ -1,7 +1,7 @@
 # mypy: disallow_untyped_defs=False
 # IF things in this file continue get messy (I'd say 300+ lines) it may be time to
 # find a package that parses https://schema.org/Recipe properly (or create one ourselves).
-
+from __future__ import annotations
 
 from itertools import chain
 
@@ -24,13 +24,24 @@ class SchemaOrg:
         itemtypes = itemtype if isinstance(itemtype, list) else [itemtype]
         return schematype.lower() in "\n".join(itemtypes).lower()
 
+    def _find_entity(self, item, schematype):
+        if self._contains_schematype(item, schematype):
+            return item
+        for graph_item in item.get("@graph", []):
+            if self._contains_schematype(graph_item, schematype):
+                return graph_item
+
     def __init__(self, page_data, raw=False):
         if raw:
             self.format = "raw"
             self.data = page_data
+            self.people = {}
+            self.ratingsdata = {}
             return
         self.format = None
         self.data = {}
+        self.people = {}
+        self.ratingsdata = {}
 
         data = extruct.extract(
             page_data,
@@ -38,6 +49,25 @@ class SchemaOrg:
             errors="log" if settings.LOG_LEVEL <= 10 else "ignore",
             uniform=True,
         )
+
+        # Extract person references
+        for syntax in SYNTAXES:
+            syntax_data = data.get(syntax, [])
+            for item in syntax_data:
+                if person := self._find_entity(item, "Person"):
+                    key = person.get("@id") or person.get("url")
+                    if key:
+                        self.people[key] = person
+
+        # Extract ratings data
+        for syntax in SYNTAXES:
+            syntax_data = data.get(syntax, [])
+            for item in syntax_data:
+                rating = self._find_entity(item, "AggregateRating")
+                if rating:
+                    rating_id = rating.get("@id")
+                    if rating_id:
+                        self.ratingsdata[rating_id] = rating
 
         for syntax in SYNTAXES:
             # make sure entries of type Recipe are always parsed first
@@ -53,17 +83,10 @@ class SchemaOrg:
                     continue
 
                 # If the item itself is a recipe, then use it directly as our datasource
-                if self._contains_schematype(item, "Recipe"):
+                if recipe := self._find_entity(item, "Recipe"):
                     self.format = syntax
-                    self.data = item
+                    self.data = recipe
                     return
-
-                # Check for recipe items within the item's entity graph
-                for graph_item in item.get("@graph", []):
-                    if self._contains_schematype(graph_item, "Recipe"):
-                        self.format = syntax
-                        self.data = graph_item
-                        return
 
                 # If the item is a webpage and describes a recipe entity, use the entity as our datasource
                 if self._contains_schematype(item, "WebPage"):
@@ -95,39 +118,50 @@ class SchemaOrg:
         ):
             author = author[0]
         if author and isinstance(author, dict):
+            author_key = author.get("@id") or author.get("url")
+            if author_key and author_key in self.people:
+                author = self.people[author_key]
+        if author and isinstance(author, dict):
             author = author.get("name")
         if author:
             return author.strip()
+
+    def _read_duration_field(self, k: str) -> int | None:
+        v = self.data.get(k)
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return get_minutes(v)
+        # Workaround: strictly speaking schema.org does not provide for minValue and maxValue properties on objects of type Duration; they are however present on objects with type QuantitativeValue
+        # Refs:
+        #  - https://schema.org/Duration
+        #  - https://schema.org/QuantitativeValue
+        if isinstance(v, dict) and v.get("maxValue"):
+            return get_minutes(v["maxValue"])
+        return None
 
     def total_time(self):
         if not (self.data.keys() & {"totalTime", "prepTime", "cookTime"}):
             raise SchemaOrgException("Cooking time information not found in SchemaOrg")
 
-        def get_key_and_minutes(k):
-            source = self.data.get(k)
-            # Workaround: strictly speaking schema.org does not provide for minValue (and maxValue) properties on objects of type Duration; they are however present on objects with type QuantitativeValue
-            # Refs:
-            #  - https://schema.org/Duration
-            #  - https://schema.org/QuantitativeValue
-            if type(source) == dict and "minValue" in source:
-                source = source["minValue"]
-            return get_minutes(source, return_zero_on_not_found=True)
+        total_time = self._read_duration_field("totalTime")
+        if total_time:
+            return total_time
 
-        total_time = get_key_and_minutes("totalTime")
-        if not total_time:
-            times = list(map(get_key_and_minutes, ["prepTime", "cookTime"]))
-            total_time = sum(times)
-        return total_time
+        prep_time = self._read_duration_field("prepTime") or 0
+        cook_time = self._read_duration_field("cookTime") or 0
+        if prep_time or cook_time:
+            return prep_time + cook_time
 
     def cook_time(self):
         if not (self.data.keys() & {"cookTime"}):
             raise SchemaOrgException("Cooktime information not found in SchemaOrg")
-        return get_minutes(self.data.get("cookTime"), return_zero_on_not_found=True)
+        return self._read_duration_field("cookTime")
 
     def prep_time(self):
         if not (self.data.keys() & {"prepTime"}):
             raise SchemaOrgException("Preptime information not found in SchemaOrg")
-        return get_minutes(self.data.get("prepTime"), return_zero_on_not_found=True)
+        return self._read_duration_field("prepTime")
 
     def yields(self):
         if not (self.data.keys() & {"recipeYield", "yield"}):
@@ -166,25 +200,26 @@ class SchemaOrg:
         if ingredients and isinstance(ingredients[0], list):
             ingredients = list(chain(*ingredients))  # flatten
 
+        if ingredients and isinstance(ingredients, str):
+            ingredients = [ingredients]
+
         return [
             normalize_string(ingredient) for ingredient in ingredients if ingredient
         ]
 
     def nutrients(self):
         nutrients = self.data.get("nutrition", {})
+        cleaned_nutrients = {}
 
-        # Some recipes contain null or numbers which breaks normalize_string()
-        # We'll ignore null and convert numbers to a string, like Schema validator does
-        for key, val in nutrients.copy().items():
-            if val is None:
-                del nutrients[key]
-            elif type(val) in [int, float]:
-                nutrients[key] = str(val)
+        for key, val in nutrients.items():
+            if not key or key.startswith("@") or not val:
+                continue
+
+            cleaned_nutrients[key] = str(val)
 
         return {
             normalize_string(nutrient): normalize_string(value)
-            for nutrient, value in nutrients.items()
-            if nutrient != "@type" and value is not None
+            for nutrient, value in cleaned_nutrients.items()
         }
 
     def _extract_howto_instructions_text(self, schema_item):
@@ -200,6 +235,8 @@ class SchemaOrg:
                     schema_item.get("name").rstrip(".")
                 ):
                     instructions_gist.append(schema_item.get("name"))
+            if schema_item.get("itemListElement"):
+                schema_item = schema_item.get("itemListElement")
             instructions_gist.append(schema_item.get("text"))
         elif schema_item.get("@type") == "HowToSection":
             name = schema_item.get("name") or schema_item.get("Name")
@@ -212,8 +249,15 @@ class SchemaOrg:
     def instructions(self):
         instructions = self.data.get("recipeInstructions") or ""
 
-        if instructions and isinstance(instructions[0], list):
+        if (
+            instructions
+            and isinstance(instructions, list)
+            and isinstance(instructions[0], list)
+        ):
             instructions = list(chain(*instructions))  # flatten
+
+        if isinstance(instructions, dict):
+            instructions = instructions.get("itemListElement")
 
         if isinstance(instructions, list):
             instructions_gist = []
@@ -229,17 +273,18 @@ class SchemaOrg:
         return instructions
 
     def ratings(self):
-        ratings = self.data.get("aggregateRating")
-        if ratings is None:
-            raise SchemaOrgException("No ratings data in SchemaOrg.")
-
-        if isinstance(ratings, dict):
+        ratings = self.data.get("aggregateRating") or self._find_entity(
+            self.data, "AggregateRating"
+        )
+        if ratings and isinstance(ratings, dict):
+            rating_id = ratings.get("@id")
+            if rating_id and rating_id in self.ratingsdata:
+                ratings = self.ratingsdata[rating_id]
+        if ratings and isinstance(ratings, dict):
             ratings = ratings.get("ratingValue")
-
-        if ratings is None:
-            raise SchemaOrgException("No ratingValue in SchemaOrg.")
-
-        return round(float(ratings), 2)
+        if ratings:
+            return round(float(ratings), 2)
+        raise SchemaOrgException("No ratingValue in SchemaOrg.")
 
     def cuisine(self):
         cuisine = self.data.get("recipeCuisine")

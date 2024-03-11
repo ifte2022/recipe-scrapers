@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 
 from recipe_scrapers.settings import settings
 
+from ._grouping_utils import IngredientGroup
 from ._schemaorg import SchemaOrg
 
 # some sites close their content for 'bots', so user-agent must be supplied
@@ -52,7 +53,7 @@ class AbstractScraper:
 
         # attach the plugins as instructed in settings.PLUGINS
         if not hasattr(self.__class__, "plugins_initialized"):
-            for name, func in inspect.getmembers(self, inspect.ismethod):
+            for name, _ in inspect.getmembers(self, inspect.ismethod):
                 current_method = getattr(self.__class__, name)
                 for plugin in reversed(settings.PLUGINS):
                     if plugin.should_run(self.host(), name):
@@ -133,6 +134,9 @@ class AbstractScraper:
     def ingredients(self):
         raise NotImplementedError("This should be implemented.")
 
+    def ingredient_groups(self) -> List[IngredientGroup]:
+        return [IngredientGroup(purpose=None, ingredients=self.ingredients())]
+
     def instructions(self) -> str:
         """instructions to prepare the recipe"""
         raise NotImplementedError("This should be implemented.")
@@ -160,6 +164,9 @@ class AbstractScraper:
     def reviews(self):
         raise NotImplementedError("This should be implemented.")
 
+    def equipment(self):
+        raise NotImplementedError("This should be implemented.")
+
     def links(self):
         invalid_href = {"#", ""}
         links_html = self.soup.findAll("a", href=True)
@@ -180,7 +187,10 @@ class AbstractScraper:
         ]
         for method in public_method_names:
             try:
-                json_dict[method] = getattr(self, method)()
+                if method == "ingredient_groups":
+                    json_dict[method] = [i.__dict__ for i in getattr(self, method)()]
+                else:
+                    json_dict[method] = getattr(self, method)()
             except Exception:
                 pass
         return json_dict
